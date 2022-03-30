@@ -68,6 +68,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -249,12 +250,33 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.Success = true
-	rf.updateTerm(args.Term)
+	if args.Term >= rf.currentTerm &&
+		(args.PrevLogIndex == 0 || args.PrevLogIndex < len(rf.logs) && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm) {
+		reply.Success = true
+		rf.logs = rf.logs[:args.PrevLogIndex+1]
+		rf.logs = append(rf.logs, args.Entries...)
 
+		if args.LeaderCommit > rf.commitIndex {
+			if args.LeaderCommit < len(rf.logs) {
+				rf.commitIndex = args.LeaderCommit
+			} else {
+				rf.commitIndex = len(rf.logs) - 1
+			}
+		}
+		rf.applyLogs()
+	}
+
+	reply.Term = rf.currentTerm
+	rf.updateTerm(args.Term)
 	if rf.currentTerm == args.Term {
 		go func() { rf.stopTimer <- struct{}{} }()
+	}
+}
+
+func (rf *Raft) applyLogs() {
+	for rf.lastApplied < rf.commitIndex {
+		rf.lastApplied++
+		rf.applyCh <- ApplyMsg{true, rf.logs[rf.lastApplied].Command, rf.lastApplied}
 	}
 }
 
@@ -292,13 +314,92 @@ func callWithTimeout(f func()) bool {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	index := len(rf.logs)
 
 	// Your code here (2B).
+	if rf.isLeader {
+		rf.logs = append(rf.logs, Log{command, rf.currentTerm})
+		rf.matchIndexes[rf.me] = len(rf.logs) - 1
+		rf.nextIndexes[rf.me] = len(rf.logs)
+		go func() {
+			rf.mu.Lock()
+			wg := sync.WaitGroup{}
+			wg.Add(len(rf.peers) - 1)
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				server := i
+				args := rf.buildAppendEntriesArgs(i)
+				reply := &AppendEntriesReply{}
+				var tryAppend func()
+				tryAppend = func() {
+					if rf.sendAppendEntries(server, args, reply) {
+						if reply.Success {
+							rf.nextIndexes[server] = len(rf.logs)
+							rf.matchIndexes[server] = len(rf.logs) - 1
+							return
+						}
+						rf.updateTerm(reply.Term)
+						if rf.isLeader {
+							args.PrevLogIndex--
+							args.Entries = rf.logs[args.PrevLogIndex+1:]
+							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
+							tryAppend()
+						}
+					}
+				}
+				go func() {
+					defer wg.Done()
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					tryAppend()
+				}()
+			}
+			rf.mu.Unlock()
+			wg.Wait()
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if !rf.isLeader {
+				return
+			}
+			a := make([]int, len(rf.matchIndexes))
+			copy(a, rf.matchIndexes)
+			i := quickSelect(a, 0, len(a)-1, (len(a)-1)/2)
+			if i > rf.commitIndex && rf.logs[i].Term == rf.currentTerm {
+				rf.commitIndex = i
+				rf.applyLogs()
+			}
+		}()
+	}
+	return index, rf.currentTerm, rf.isLeader
+}
 
-	return index, term, isLeader
+func (rf *Raft) buildAppendEntriesArgs(i int) *AppendEntriesArgs {
+	prevIndex := rf.nextIndexes[i] - 1
+	return &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: prevIndex,
+		PrevLogTerm: rf.logs[prevIndex].Term, Entries: rf.logs[prevIndex+1:], LeaderCommit: rf.commitIndex}
+}
+
+func quickSelect(a []int, l, r, k int) int {
+	i, j := l, l+1
+	for j <= r {
+		if a[j] < a[l] {
+			i++
+			a[i], a[j] = a[j], a[i]
+		}
+		j++
+	}
+	a[l], a[i] = a[i], a[l]
+	if i == k {
+		return a[i]
+	} else if i < k {
+		return quickSelect(a, i+1, r, k)
+	} else {
+		return quickSelect(a, l, i-1, k)
+	}
 }
 
 //
@@ -339,8 +440,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.logs = []Log{Log{}} // log index starts at 1
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -404,8 +507,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						if votes > len(peers)/2 {
 							rf.mu.Lock()
 							rf.isLeader = true
+							rf.matchIndexes = make([]int, len(peers))
+							rf.nextIndexes = make([]int, len(peers))
+							for i := range rf.nextIndexes {
+								rf.nextIndexes[i] = len(rf.logs)
+							}
 							rf.ticker.Reset(heartBeatInterval)
-							args := &AppendEntriesArgs{Term: rf.currentTerm, LeaderId: me}
 							rf.mu.Unlock()
 							for {
 								<-rf.ticker.C
@@ -421,6 +528,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										continue
 									}
 									server := i
+									args := rf.buildAppendEntriesArgs(i)
 									go func() {
 										reply := &AppendEntriesReply{}
 										if rf.sendAppendEntries(server, args, reply) {
