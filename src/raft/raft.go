@@ -18,11 +18,13 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -119,13 +121,20 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	buffer := new(bytes.Buffer)
+	e := labgob.NewEncoder(buffer)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	rf.persister.SaveRaftState(buffer.Bytes())
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
@@ -141,6 +150,11 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buffer := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(buffer)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.logs)
 }
 
 //
@@ -200,6 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(args.LastLogTerm > lastLogTerm || args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 	if reply.VoteGranted {
 		rf.votedFor = args.CandidateId
+		rf.persist()
 	}
 }
 
@@ -208,6 +223,7 @@ func (rf *Raft) updateTerm(term int) bool {
 		rf.currentTerm = term
 		rf.votedFor = -1
 		rf.isLeader = false
+		rf.persist()
 		return true
 	}
 	return false
@@ -253,8 +269,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.currentTerm &&
 		(args.PrevLogIndex == 0 || args.PrevLogIndex < len(rf.logs) && rf.logs[args.PrevLogIndex].Term == args.PrevLogTerm) {
 		reply.Success = true
-		rf.logs = rf.logs[:args.PrevLogIndex+1]
-		rf.logs = append(rf.logs, args.Entries...)
+		if len(args.Entries) > 0 {
+			rf.logs = rf.logs[:args.PrevLogIndex+1]
+			rf.logs = append(rf.logs, args.Entries...)
+			rf.persist()
+		}
 
 		if args.LeaderCommit > rf.commitIndex {
 			if args.LeaderCommit < len(rf.logs) {
@@ -321,6 +340,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if rf.isLeader {
 		rf.logs = append(rf.logs, Log{command, rf.currentTerm})
+		rf.persist()
 		rf.matchIndexes[rf.me] = len(rf.logs) - 1
 		rf.nextIndexes[rf.me] = len(rf.logs)
 		go func() {
@@ -343,7 +363,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 							return
 						}
 						rf.updateTerm(reply.Term)
-						if rf.isLeader {
+						if rf.isLeader && args.PrevLogIndex > 0 {
 							args.PrevLogIndex--
 							args.Entries = rf.logs[args.PrevLogIndex+1:]
 							args.PrevLogTerm = rf.logs[args.PrevLogIndex].Term
@@ -464,6 +484,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.mu.Lock()
 				rf.currentTerm++
 				rf.votedFor = me
+				rf.persist()
 				lastLogIndex := len(rf.logs) - 1
 				lastLogTerm := -1
 				if lastLogIndex >= 0 {
