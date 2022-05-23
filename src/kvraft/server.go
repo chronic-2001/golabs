@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -99,6 +100,15 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) readSnapshot(data []byte) {
+	if len(data) > 0 {
+		buffer := bytes.NewBuffer(data)
+		d := labgob.NewDecoder(buffer)
+		d.Decode(&kv.values)
+		d.Decode(&kv.requestIds)
+	}
+}
+
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -126,9 +136,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.values = make(map[string]string)
 	kv.requestIds = make(map[int64]int64)
 	kv.channels = make(map[string]chan string)
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf.Maxraftstate = maxraftstate
 
 	// You may need initialization code here.
 	go func() {
@@ -147,6 +159,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 				if ch, ok := kv.channels[fmt.Sprintf("%d_%d", op.ClientId, op.RequestId)]; ok {
 					ch <- kv.values[op.Key]
+				}
+			} else {
+				if applyMsg.Snapshot == nil {
+					buffer := new(bytes.Buffer)
+					e := labgob.NewEncoder(buffer)
+					e.Encode(kv.values)
+					e.Encode(kv.requestIds)
+					kv.applyCh <- raft.ApplyMsg{Snapshot: buffer.Bytes()}
+				} else {
+					kv.readSnapshot(applyMsg.Snapshot)
 				}
 			}
 			kv.mu.Unlock()
