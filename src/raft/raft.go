@@ -438,13 +438,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTicker = time.NewTicker(heartbeatInterval)
 	rf.heartbeatTicker.Stop()
 	go func() {
-		for {
+		for !rf.killed() {
 			select {
 			case <-rf.electionTimer.C:
 				rf.startElection()
 			case <-rf.heartbeatTicker.C:
 				rf.mu.Lock()
-				rf.sendHeartbeats()
+				if rf.isLeader {
+					rf.sendHeartbeats()
+				}
 				rf.mu.Unlock()
 			}
 		}
@@ -470,6 +472,9 @@ func (rf *Raft) sendHeartbeats() {
 					if rf.sendInstallSnapshot(i, args, reply) {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
+						if !rf.isLeader {
+							return
+						}
 						if args.Term != rf.currentTerm {
 							return
 						}
@@ -498,6 +503,9 @@ func (rf *Raft) sendHeartbeats() {
 					if rf.sendAppendEntries(i, args, reply) {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
+						if !rf.isLeader {
+							return
+						}
 						if args.Term != rf.currentTerm {
 							return
 						}

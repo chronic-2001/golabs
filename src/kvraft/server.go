@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"bytes"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -45,34 +44,36 @@ type KVServer struct {
 	// Your definitions here.
 	values     map[string]string
 	requestIds map[int64]int64
-	channels   map[string]chan string
+	channels   map[int]chan Op
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	reply.Value, reply.Err = kv.waitForApply(&Op{args.ClientId, args.RequestId, "Get", args.Key, ""})
+	reply.Value, reply.Err = kv.waitForApply(Op{args.ClientId, args.RequestId, "Get", args.Key, ""})
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	_, reply.Err = kv.waitForApply(&Op{args.ClientId, args.RequestId, args.Op, args.Key, args.Value})
+	_, reply.Err = kv.waitForApply(Op{args.ClientId, args.RequestId, args.Op, args.Key, args.Value})
 }
 
-func (kv *KVServer) waitForApply(op *Op) (string, Err) {
+func (kv *KVServer) waitForApply(op Op) (string, Err) {
 	var value string
 	var err Err = ErrWrongLeader
-	if _, _, isLeader := kv.rf.Start(op); isLeader {
+	if index, _, isLeader := kv.rf.Start(op); isLeader {
 		kv.mu.Lock()
-		ch := make(chan string, 1)
-		chKey := fmt.Sprintf("%d_%d", op.ClientId, op.RequestId)
-		kv.channels[chKey] = ch
+		ch := make(chan Op, 1)
+		kv.channels[index] = ch
 		kv.mu.Unlock()
 		select {
-		case value = <-ch:
-			err = ""
+		case res := <-ch:
+			if res.ClientId == op.ClientId && res.RequestId == op.RequestId {
+				value = res.Value
+				err = ""
+			}
 		case <-time.After(500 * time.Millisecond):
 		}
 		kv.mu.Lock()
-		delete(kv.channels, chKey)
+		delete(kv.channels, index)
 		kv.mu.Unlock()
 	}
 
@@ -126,7 +127,7 @@ func (kv *KVServer) readSnapshot(data []byte) {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(&Op{})
+	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -135,7 +136,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.values = make(map[string]string)
 	kv.requestIds = make(map[int64]int64)
-	kv.channels = make(map[string]chan string)
+	kv.channels = make(map[int]chan Op)
 	kv.readSnapshot(persister.ReadSnapshot())
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -147,7 +148,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for applyMsg := range kv.applyCh {
 			kv.mu.Lock()
 			if applyMsg.CommandValid {
-				op := applyMsg.Command.(*Op)
+				op := applyMsg.Command.(Op)
 				if op.RequestId > kv.requestIds[op.ClientId] {
 					switch op.Name {
 					case "Put":
@@ -157,8 +158,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					}
 					kv.requestIds[op.ClientId] = op.RequestId
 				}
-				if ch, ok := kv.channels[fmt.Sprintf("%d_%d", op.ClientId, op.RequestId)]; ok {
-					ch <- kv.values[op.Key]
+				if ch, ok := kv.channels[applyMsg.CommandIndex]; ok {
+					op.Value = kv.values[op.Key]
+					ch <- op
 				}
 			} else {
 				if applyMsg.Snapshot == nil {

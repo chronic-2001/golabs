@@ -1,7 +1,6 @@
 package shardmaster
 
 import (
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -21,7 +20,7 @@ type ShardMaster struct {
 
 	configs    []Config // indexed by config num
 	requestIds map[int64]int64
-	channels   map[string]chan struct{}
+	channels   map[int]chan Op
 }
 
 type Op struct {
@@ -36,19 +35,18 @@ type command interface {
 
 func (sm *ShardMaster) waitForApply(op Op) bool {
 	wrongLeader := true
-	if _, _, isLeader := sm.rf.Start(op); isLeader {
+	if index, _, isLeader := sm.rf.Start(op); isLeader {
 		sm.mu.Lock()
-		ch := make(chan struct{}, 1)
-		chKey := fmt.Sprintf("%d_%d", op.ClientId, op.RequestId)
-		sm.channels[chKey] = ch
+		ch := make(chan Op, 1)
+		sm.channels[index] = ch
 		sm.mu.Unlock()
 		select {
-		case <-ch:
-			wrongLeader = false
+		case res := <-ch:
+			wrongLeader = res.ClientId != op.ClientId || res.RequestId != op.RequestId
 		case <-time.After(500 * time.Millisecond):
 		}
 		sm.mu.Lock()
-		delete(sm.channels, chKey)
+		delete(sm.channels, index)
 		sm.mu.Unlock()
 	}
 
@@ -74,6 +72,8 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 	reply.WrongLeader = sm.waitForApply(Op{args.ClientId, args.RequestId, args})
 	if !reply.WrongLeader {
+		sm.mu.Lock()
+		defer sm.mu.Unlock()
 		num := args.Num
 		if num == -1 || num >= len(sm.configs) {
 			num = len(sm.configs) - 1
@@ -195,7 +195,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Groups = map[int][]string{}
 	sm.requestIds = make(map[int64]int64)
-	sm.channels = make(map[string]chan struct{})
+	sm.channels = make(map[int]chan Op)
 
 	labgob.Register(Op{})
 	labgob.Register(&JoinArgs{})
@@ -214,8 +214,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 				op.Command.execute(sm)
 				sm.requestIds[op.ClientId] = op.RequestId
 			}
-			if ch, ok := sm.channels[fmt.Sprintf("%d_%d", op.ClientId, op.RequestId)]; ok {
-				close(ch)
+			if ch, ok := sm.channels[applyMsg.CommandIndex]; ok {
+				ch <- op
 			}
 			sm.mu.Unlock()
 		}
