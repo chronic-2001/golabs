@@ -1,40 +1,192 @@
 package shardkv
 
+import (
+	"bytes"
+	"sync"
+	"sync/atomic"
+	"time"
 
-// import "../shardmaster"
-import "../labrpc"
-import "../raft"
-import "sync"
-import "../labgob"
+	"../labgob"
+	"../labrpc"
+	"../raft"
+	"../shardmaster"
+)
 
+type ShardStatus int32
 
+const (
+	Ready ShardStatus = iota
+	Receiving
+	Sending
+)
+
+type Shard struct {
+	Index      int
+	Status     ShardStatus
+	Values     map[string]string
+	RequestIds map[int64]int64
+}
+
+type MigrateArgs struct {
+	ConfigNum int
+	Shards    []Shard
+	ClientId  int64
+	RequestId int64
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClientId  int64
+	RequestId int64
+	Command   command
 }
+
+type command interface {
+	execute(kv *ShardKV) Reply
+}
+
+type Config shardmaster.Config
 
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
+	dead         int32 // set by Kill()
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
-	masters      []*labrpc.ClientEnd
+	master       *shardmaster.Clerk
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	shards    [shardmaster.NShards]Shard
+	channels  map[int]chan Reply
+	config    Config
+	clientId  int64
+	requestId int64
 }
 
-
-func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+func (kv *ShardKV) Get(args *GetArgs, reply *Reply) {
 	// Your code here.
+	*reply = kv.waitForApply(&Op{args.ClientId, args.RequestId, args})
 }
 
-func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *Reply) {
 	// Your code here.
+	*reply = kv.waitForApply(&Op{args.ClientId, args.RequestId, args})
+}
+
+func (kv *ShardKV) Migrate(args *MigrateArgs, reply *Reply) {
+	// Your code here.
+	*reply = kv.waitForApply(&Op{args.ClientId, args.RequestId, args})
+}
+
+func (args *GetArgs) execute(kv *ShardKV) Reply {
+	reply := Reply{}
+	shard := &kv.shards[key2shard(args.Key)]
+	reply.Err = kv.checkShard(shard)
+	if reply.Err == OK {
+		reply.Value = shard.Values[args.Key]
+	}
+	return reply
+}
+
+func (args *PutAppendArgs) execute(kv *ShardKV) Reply {
+	reply := Reply{}
+	shard := &kv.shards[key2shard(args.Key)]
+	reply.Err = kv.checkShard(shard)
+	if reply.Err == OK {
+		if args.RequestId > shard.RequestIds[args.ClientId] {
+			if args.Op == "Put" {
+				shard.Values[args.Key] = args.Value
+			} else {
+				shard.Values[args.Key] += args.Value
+			}
+			shard.RequestIds[args.ClientId] = args.RequestId
+		}
+	}
+	return reply
+}
+
+func (args *MigrateArgs) execute(kv *ShardKV) Reply {
+	reply := Reply{Err: OK}
+	if args.ConfigNum > kv.config.Num {
+		reply.Err = ErrWrongLeader
+	} else if args.ConfigNum == kv.config.Num {
+		for _, shard := range args.Shards {
+			myShard := &kv.shards[shard.Index]
+			if myShard.Status != Ready {
+				myShard.Status = Ready
+				myShard.Values = clone(shard.Values)
+				myShard.RequestIds = clone(shard.RequestIds)
+			}
+		}
+	}
+	return reply
+}
+
+func (kv *ShardKV) checkShard(shard *Shard) Err {
+	if shard.Status == Receiving {
+		return ErrWrongLeader
+	} else if shard.Status == Sending || shard.Values == nil {
+		return ErrWrongGroup
+	} else {
+		return OK
+	}
+}
+
+func (config Config) execute(kv *ShardKV) Reply {
+	if config.Num > kv.config.Num {
+		for i, gid := range config.Shards {
+			oldGid := kv.config.Shards[i]
+			if gid != kv.gid && oldGid == kv.gid {
+				kv.shards[i].Status = Sending
+			} else if gid == kv.gid && oldGid != kv.gid {
+				if oldGid == 0 {
+					kv.shards[i].Values = make(map[string]string)
+					kv.shards[i].RequestIds = make(map[int64]int64)
+				} else {
+					kv.shards[i].Status = Receiving
+				}
+			}
+		}
+		kv.config = config
+	}
+
+	return Reply{Err: OK}
+}
+
+func (kv *ShardKV) waitForApply(op *Op) Reply {
+	var reply Reply
+	if index, _, isLeader := kv.rf.Start(op); isLeader {
+		kv.mu.Lock()
+		ch := make(chan Reply, 1)
+		kv.channels[index] = ch
+		kv.mu.Unlock()
+		select {
+		case reply = <-ch:
+			if reply.ClientId != op.ClientId || reply.RequestId != op.RequestId {
+				reply.Err = ErrWrongLeader
+			}
+		case <-time.After(500 * time.Millisecond):
+			reply.Err = ErrWrongLeader
+		}
+		kv.mu.Lock()
+		delete(kv.channels, index)
+		kv.mu.Unlock()
+	}
+	return reply
+}
+
+func (kv *ShardKV) readSnapshot(data []byte) {
+	if len(data) > 0 {
+		buffer := bytes.NewBuffer(data)
+		d := labgob.NewDecoder(buffer)
+		d.Decode(&kv.config)
+		d.Decode(&kv.shards)
+	}
 }
 
 //
@@ -44,10 +196,26 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
 
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
+
+func clone[K comparable, V any](source map[K]V) map[K]V {
+	if source == nil {
+		return nil
+	}
+	target := make(map[K]V)
+	for k, v := range source {
+		target[k] = v
+	}
+	return target
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -80,23 +248,145 @@ func (kv *ShardKV) Kill() {
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(&Op{})
+	labgob.Register(&GetArgs{})
+	labgob.Register(&PutAppendArgs{})
+	labgob.Register(&MigrateArgs{})
+	labgob.Register(Config{})
 
 	kv := new(ShardKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.make_end = make_end
 	kv.gid = gid
-	kv.masters = masters
+	kv.master = shardmaster.MakeClerk(masters)
 
 	// Your initialization code here.
+	kv.channels = make(map[int]chan Reply)
+	kv.clientId = nrand()
+	for i := range kv.shards {
+		kv.shards[i].Index = i
+	}
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.rf.Maxraftstate = maxraftstate
 
+	go func() {
+		for applyMsg := range kv.applyCh {
+			kv.mu.Lock()
+			if applyMsg.CommandValid {
+				op := applyMsg.Command.(*Op)
+				reply := op.Command.execute(kv)
+				if ch, ok := kv.channels[applyMsg.CommandIndex]; ok {
+					reply.ClientId = op.ClientId
+					reply.RequestId = op.RequestId
+					ch <- reply
+				}
+			} else {
+				if applyMsg.Snapshot == nil {
+					buffer := new(bytes.Buffer)
+					e := labgob.NewEncoder(buffer)
+					e.Encode(kv.config)
+					e.Encode(kv.shards)
+					kv.applyCh <- raft.ApplyMsg{Snapshot: buffer.Bytes()}
+				} else {
+					kv.readSnapshot(applyMsg.Snapshot)
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}()
+
+	go func() {
+		for !kv.killed() {
+			time.Sleep(100 * time.Millisecond)
+			if _, isLeader := kv.rf.GetState(); !isLeader {
+				continue
+			}
+			kv.mu.Lock()
+			config := kv.config
+			reconfiguring := false
+			sendingShards := make(map[int][]Shard)
+			for _, shard := range kv.shards {
+				if shard.Status != Ready {
+					reconfiguring = true
+				}
+				if shard.Status == Sending {
+					gid := config.Shards[shard.Index]
+					shard.Values = clone(shard.Values)
+					shard.RequestIds = clone(shard.RequestIds)
+					sendingShards[gid] = append(sendingShards[gid], shard)
+				}
+			}
+			kv.mu.Unlock()
+			if len(sendingShards) > 0 {
+				var wg sync.WaitGroup
+				for gid, shards := range sendingShards {
+					args := MigrateArgs{
+						config.Num,
+						shards,
+						kv.clientId,
+						atomic.AddInt64(&kv.requestId, 1)}
+					servers := config.Groups[gid]
+					wg.Add(1)
+					go func() {
+						for {
+							for _, server := range servers {
+								srv := kv.make_end(server)
+								var reply Reply
+								ok := srv.Call("ShardKV.Migrate", &args, &reply)
+								if ok && reply.Err == OK {
+									wg.Done()
+									return
+								}
+							}
+							time.Sleep(100 * time.Millisecond)
+						}
+					}()
+				}
+				wg.Wait()
+			}
+
+			if _, isLeader := kv.rf.GetState(); !isLeader {
+				continue
+			}
+			var wg sync.WaitGroup
+			for _, shards := range sendingShards {
+				for i := range shards {
+					shards[i].Values = nil
+					shards[i].RequestIds = nil
+				}
+				args := MigrateArgs{
+					config.Num,
+					shards,
+					kv.clientId,
+					atomic.AddInt64(&kv.requestId, 1)}
+				var reply Reply
+				wg.Add(1)
+				go func() {
+					kv.Migrate(&args, &reply)
+					wg.Done()
+				}()
+			}
+			wg.Wait()
+			if reconfiguring {
+				continue
+			}
+
+			nextConfig := Config(kv.master.Query(config.Num + 1))
+			if _, isLeader := kv.rf.GetState(); !isLeader {
+				continue
+			}
+			if nextConfig.Num > config.Num {
+				kv.waitForApply(&Op{kv.clientId, atomic.AddInt64(&kv.requestId, 1), nextConfig})
+			}
+		}
+	}()
 
 	return kv
 }
