@@ -138,7 +138,7 @@ func (kv *ShardKV) checkShard(shard *Shard) Err {
 }
 
 func (config Config) execute(kv *ShardKV) Reply {
-	if config.Num > kv.config.Num {
+	if config.Num == kv.config.Num+1 {
 		for i, gid := range config.Shards {
 			oldGid := kv.config.Shards[i]
 			if gid != kv.gid && oldGid == kv.gid {
@@ -159,7 +159,7 @@ func (config Config) execute(kv *ShardKV) Reply {
 }
 
 func (kv *ShardKV) waitForApply(op *Op) Reply {
-	var reply Reply
+	reply := Reply{Err: ErrWrongLeader}
 	if index, _, isLeader := kv.rf.Start(op); isLeader {
 		kv.mu.Lock()
 		ch := make(chan Reply, 1)
@@ -171,7 +171,6 @@ func (kv *ShardKV) waitForApply(op *Op) Reply {
 				reply.Err = ErrWrongLeader
 			}
 		case <-time.After(500 * time.Millisecond):
-			reply.Err = ErrWrongLeader
 		}
 		kv.mu.Lock()
 		delete(kv.channels, index)
@@ -302,91 +301,81 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		}
 	}()
 
-	go func() {
-		for !kv.killed() {
-			time.Sleep(100 * time.Millisecond)
-			if _, isLeader := kv.rf.GetState(); !isLeader {
-				continue
-			}
-			kv.mu.Lock()
-			config := kv.config
-			reconfiguring := false
-			sendingShards := make(map[int][]Shard)
-			for _, shard := range kv.shards {
-				if shard.Status != Ready {
-					reconfiguring = true
-				}
-				if shard.Status == Sending {
-					gid := config.Shards[shard.Index]
-					shard.Values = clone(shard.Values)
-					shard.RequestIds = clone(shard.RequestIds)
-					sendingShards[gid] = append(sendingShards[gid], shard)
-				}
-			}
-			kv.mu.Unlock()
-			if len(sendingShards) > 0 {
-				var wg sync.WaitGroup
-				for gid, shards := range sendingShards {
-					args := MigrateArgs{
-						config.Num,
-						shards,
-						kv.clientId,
-						atomic.AddInt64(&kv.requestId, 1)}
-					servers := config.Groups[gid]
-					wg.Add(1)
-					go func() {
-						for {
-							for _, server := range servers {
-								srv := kv.make_end(server)
-								var reply Reply
-								ok := srv.Call("ShardKV.Migrate", &args, &reply)
-								if ok && reply.Err == OK {
-									wg.Done()
-									return
-								}
-							}
-							time.Sleep(100 * time.Millisecond)
-						}
-					}()
-				}
-				wg.Wait()
-			}
-
-			if _, isLeader := kv.rf.GetState(); !isLeader {
-				continue
-			}
-			var wg sync.WaitGroup
-			for _, shards := range sendingShards {
-				for i := range shards {
-					shards[i].Values = nil
-					shards[i].RequestIds = nil
-				}
-				args := MigrateArgs{
-					config.Num,
-					shards,
-					kv.clientId,
-					atomic.AddInt64(&kv.requestId, 1)}
-				var reply Reply
-				wg.Add(1)
-				go func() {
-					kv.Migrate(&args, &reply)
-					wg.Done()
-				}()
-			}
-			wg.Wait()
-			if reconfiguring {
-				continue
-			}
-
-			nextConfig := Config(kv.master.Query(config.Num + 1))
-			if _, isLeader := kv.rf.GetState(); !isLeader {
-				continue
-			}
-			if nextConfig.Num > config.Num {
-				kv.waitForApply(&Op{kv.clientId, atomic.AddInt64(&kv.requestId, 1), nextConfig})
-			}
-		}
-	}()
-
+	go kv.setInterval(kv.pollConfig, 100*time.Millisecond)
+	go kv.setInterval(kv.sendShards, 100*time.Millisecond)
 	return kv
+}
+
+func (kv *ShardKV) setInterval(action func(), timeout time.Duration) {
+	for !kv.killed() {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			action()
+		}
+		time.Sleep(timeout)
+	}
+}
+
+func (kv *ShardKV) pollConfig() {
+	kv.mu.Lock()
+	reconfiguring := false
+	for _, shard := range kv.shards {
+		if shard.Status != Ready {
+			reconfiguring = true
+			break
+		}
+	}
+	configNum := kv.config.Num
+	kv.mu.Unlock()
+	if reconfiguring {
+		return
+	}
+	nextConfig := Config(kv.master.Query(configNum + 1))
+	if nextConfig.Num == configNum+1 {
+		kv.waitForApply(&Op{kv.clientId, atomic.AddInt64(&kv.requestId, 1), nextConfig})
+	}
+}
+
+func (kv *ShardKV) sendShards() {
+	kv.mu.Lock()
+	sendingShards := make(map[int][]Shard)
+	for _, shard := range kv.shards {
+		if shard.Status == Sending && shard.Values != nil {
+			gid := kv.config.Shards[shard.Index]
+			shard.Values = clone(shard.Values)
+			shard.RequestIds = clone(shard.RequestIds)
+			sendingShards[gid] = append(sendingShards[gid], shard)
+		}
+	}
+	var wg sync.WaitGroup
+	if len(sendingShards) > 0 {
+		for gid, shards := range sendingShards {
+			args := MigrateArgs{
+				kv.config.Num,
+				shards,
+				kv.clientId,
+				atomic.AddInt64(&kv.requestId, 1)}
+			servers := kv.config.Groups[gid]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for _, server := range servers {
+					srv := kv.make_end(server)
+					var reply Reply
+					ok := srv.Call("ShardKV.Migrate", &args, &reply)
+					if ok && reply.Err == OK {
+						for i := range args.Shards {
+							args.Shards[i].Values = nil
+							args.Shards[i].RequestIds = nil
+						}
+						args.RequestId = atomic.AddInt64(&kv.requestId, 1)
+						kv.waitForApply(&Op{args.ClientId, args.RequestId, &args})
+						return
+					}
+				}
+			}()
+		}
+	}
+	kv.mu.Unlock()
+	wg.Wait()
+
 }
