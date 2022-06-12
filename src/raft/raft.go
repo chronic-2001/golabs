@@ -158,10 +158,21 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 	buffer := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(buffer)
-	d.Decode(&rf.currentTerm)
-	d.Decode(&rf.votedFor)
-	d.Decode(&rf.logs)
-	d.Decode(&rf.startIndex)
+	var currentTerm int
+	var votedFor int
+	var logs []Log
+	var startIndex int
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil ||
+		d.Decode(&startIndex) != nil {
+		panic("Decoding rf state error!")
+	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.logs = logs
+	rf.startIndex = startIndex
 }
 
 //

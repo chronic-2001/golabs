@@ -105,8 +105,13 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	if len(data) > 0 {
 		buffer := bytes.NewBuffer(data)
 		d := labgob.NewDecoder(buffer)
-		d.Decode(&kv.values)
-		d.Decode(&kv.requestIds)
+		var values map[string]string
+		var requestIds map[int64]int64
+		if d.Decode(&values) != nil || d.Decode(&requestIds) != nil {
+			panic("Decoding kv state error!")
+		}
+		kv.values = values
+		kv.requestIds = requestIds
 	}
 }
 

@@ -183,8 +183,13 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	if len(data) > 0 {
 		buffer := bytes.NewBuffer(data)
 		d := labgob.NewDecoder(buffer)
-		d.Decode(&kv.config)
-		d.Decode(&kv.shards)
+		var config Config
+		var shards [shardmaster.NShards]Shard
+		if d.Decode(&config) != nil || d.Decode(&shards) != nil {
+			panic("Decoding kv state error!")
+		}
+		kv.config = config
+		kv.shards = shards
 	}
 }
 
