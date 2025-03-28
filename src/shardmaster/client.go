@@ -9,7 +9,7 @@ import (
 	"math/big"
 	"time"
 
-	"../labrpc"
+	"golabs/labrpc"
 )
 
 type Clerk struct {

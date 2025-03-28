@@ -6,10 +6,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"../labgob"
-	"../labrpc"
-	"../raft"
-	"../shardmaster"
+	"golabs/labgob"
+
+	"golabs/labrpc"
+
+	"golabs/raft"
+
+	"golabs/shardmaster"
 )
 
 type ShardStatus int32
@@ -193,12 +196,10 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	}
 }
 
-//
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (kv *ShardKV) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -221,7 +222,6 @@ func clone[K comparable, V any](source map[K]V) map[K]V {
 	return target
 }
 
-//
 // servers[] contains the ports of the servers in this group.
 //
 // me is the index of the current server in servers[].
@@ -248,7 +248,6 @@ func clone[K comparable, V any](source map[K]V) map[K]V {
 //
 // StartServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.

@@ -13,15 +13,14 @@ import (
 	"math/big"
 	"time"
 
-	"../labrpc"
-	"../shardmaster"
+	"golabs/labrpc"
+
+	"golabs/shardmaster"
 )
 
-//
 // which shard is a key in?
 // please use this function,
 // and please do not change it.
-//
 func key2shard(key string) int {
 	shard := 0
 	if len(key) > 0 {
@@ -47,7 +46,6 @@ type Clerk struct {
 	requestId int64
 }
 
-//
 // the tester calls MakeClerk.
 //
 // masters[] is needed to call shardmaster.MakeClerk().
@@ -55,7 +53,6 @@ type Clerk struct {
 // make_end(servername) turns a server name from a
 // Config.Groups[gid][i] into a labrpc.ClientEnd on which you can
 // send RPCs.
-//
 func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(masters)
@@ -65,12 +62,10 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	return ck
 }
 
-//
 // fetch the current value for a key.
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
-//
 func (ck *Clerk) Get(key string) string {
 	ck.requestId++
 	args := GetArgs{key, ck.clientId, ck.requestId}
@@ -100,10 +95,8 @@ func (ck *Clerk) Get(key string) string {
 
 }
 
-//
 // shared by Put and Append.
 // You will have to modify this function.
-//
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.requestId++
 	args := PutAppendArgs{key, value, op, ck.clientId, ck.requestId}

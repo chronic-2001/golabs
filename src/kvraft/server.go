@@ -7,9 +7,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"../labgob"
-	"../labrpc"
-	"../raft"
+	"golabs/labgob"
+
+	"golabs/labrpc"
+
+	"golabs/raft"
 )
 
 const Debug = 0
@@ -80,7 +82,6 @@ func (kv *KVServer) waitForApply(op Op) (string, Err) {
 	return value, err
 }
 
-//
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -89,7 +90,6 @@ func (kv *KVServer) waitForApply(op Op) (string, Err) {
 // code to Kill(). you're not required to do anything
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
-//
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
@@ -115,7 +115,6 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	}
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -128,7 +127,6 @@ func (kv *KVServer) readSnapshot(data []byte) {
 // you don't need to snapshot.
 // StartKVServer() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.

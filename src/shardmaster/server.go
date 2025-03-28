@@ -5,9 +5,11 @@ import (
 	"sync"
 	"time"
 
-	"../labgob"
-	"../labrpc"
-	"../raft"
+	"golabs/labgob"
+
+	"golabs/labrpc"
+
+	"golabs/raft"
 )
 
 type ShardMaster struct {
@@ -82,12 +84,10 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	}
 }
 
-//
 // the tester calls Kill() when a ShardMaster instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (sm *ShardMaster) Kill() {
 	sm.rf.Kill()
 	// Your code here, if desired.
@@ -182,12 +182,10 @@ func (config *Config) rebalance() {
 	}
 }
 
-//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Paxos to
 // form the fault-tolerant shardmaster service.
 // me is the index of the current server in servers[].
-//
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister) *ShardMaster {
 	sm := new(ShardMaster)
 	sm.me = me
